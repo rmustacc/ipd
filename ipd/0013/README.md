@@ -200,7 +200,7 @@ Unlike `ddi_dma_nextcookie()` this function can be called any number of
 times. There are no concerns around mutation and there is a clear
 delineation of when it is finished.
 
-The next function, `ddi_Dma_cookie_get()` was added to provide a way to
+The next function, `ddi_dma_cookie_get()` was added to provide a way to
 get specific cookies. While looking over the usage of drivers, we saw
 that sometimes drivers wanted to specifically do something with the
 first cookie (which may contain a header or something else) while the
@@ -271,5 +271,5 @@ This summarizes the changes that we're proposing to make to the system:
 * Allow `ddi_dma_addr_bind_handle()`, `ddi_dma_buf_bind_handle()`, and
 `ddi_dma_getwin()`, to receive NULL arguments for the cookie-related
 pointers.
-* add additional checking around the correctness of
+* Add additional checking around the correctness of
 `ddi_dma_nextcookie()`.
