@@ -3,7 +3,7 @@ authors: Robert Mustacchi <rm@fingolfin.org>
 state: predraft
 ---
 
-# IPD 13 Safer DDI DMA Cooke Functions
+# IPD 13 Safer DDI DMA Cookie Functions
 
 One of the responsibilities of the Device Driver Interface (DDI) is to
 provide a set of APIs to set up and handle DMA ([Direct Memory
