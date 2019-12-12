@@ -10,8 +10,9 @@ provide a set of APIs to set up and handle DMA ([Direct Memory
 Access](https://en.wikipedia.org/wiki/Direct_memory_access)). Memory is
 allocated for DMA in the vast majority of hardware device drivers. NIC
 drivers and other PCIe devices call into the DMA related functions
-directly, while some drivers like storage HBA drivers sometimes have
-some of the allocations done on their behalf.
+directly, while some drivers like storage HBA drivers have many of the
+data path allocations done on their behalf by operating system
+frameworks.
 
 To allocate and program a device with memory addresses for DMA, a device
 driver goes through three different steps:
