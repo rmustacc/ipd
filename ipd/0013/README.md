@@ -14,10 +14,10 @@ directly, while some drivers like storage HBA drivers have many of the
 data path allocations done on their behalf by operating system
 frameworks.
 
-To allocate and program a device with memory addresses for DMA, a device
-driver goes through three different steps:
+To perform DMA, all device drivers go through the following three steps
+to allocate memory:
 
-1. Allocating an opaque handle, the `ddi_dma_handle_t` which takes into
+1. Allocating an opaque handle, the `ddi_dma_handle_t`, which takes into
 account a number of the constraints that the hardware imposes. For
 example, a given hardware device may require that the requested memory
 have a specific alignment, that it can't cross a specific sized
@@ -162,7 +162,7 @@ functions with the following signatures:
 uint_t ddi_dma_ncookies(ddi_dma_handle_t *);
 const ddi_dma_cookie_t *ddi_dma_cookie_iter(ddi_dma_handle_t *, const ddi_dma_cookie_t *);
 const ddi_dma_cookie_t *ddi_dma_cookie_get(ddi_dma_handle_t *, uint_t);
-const ddi_dma_cookie+t *ddi_dma_cookie_one(ddi_dma_handle_t *);
+const ddi_dma_cookie_t *ddi_dma_cookie_one(ddi_dma_handle_t *);
 ```
 
 A manual page that documents all of these functions and explains how the
@@ -186,50 +186,52 @@ for (cookie = ddi_dma_cookie_iter(handle, NULL); cookie != NULL;
 }
 ```
 
-Another part of this and the other functions is that it returns a
-`const` pointer rather than asking the driver for storage. This was done
-purposefully. It allows us to reduce storage and makes the underlying
-implementation without mutation easier.
+Notice that these functions all return a const pointer rather than
+asking the driver for storage. This was done purposefully. This reduces
+storage and helps to avoid mutation in the implementation.
 
-A goal with this interface, while discussing with others was to make it
-so iteration could happen with a single local variable. As part of those
-discussions, folks brought up the concern of using an index based
-iterator as they were sometimes already looping over something else and
-wanted to reduce the likelihood of index collision.
+Our goal with this interface was to make iteration possible with a
+single local variable. These functions are often called while already
+iterating over a for loop with an index (`for (i = 0; i < ... ; i++)`)
+and we wanted to avoid the requirement of another integer index which
+can often lead to someone using the wrong loop index for the inner,
+nested loop.
 
-Unlike `ddi_dma_nextcookie()` this function can be called any number of
-times. There are no concerns around mutation and there is a clear
-delineation of when it is finished.
+Unlike `ddi_dma_nextcookie()`, the `ddi_dma_cookie_iter()` loop may
+performed any number of times. There are no concerns around mutation and
+there is a clear delineation of when it is finished.
 
-The next function, `ddi_dma_cookie_get()` was added to provide a way to
-get specific cookies. While looking over the usage of drivers, we saw
-that sometimes drivers wanted to specifically do something with the
-first cookie (which may contain a header or something else) while the
-rest of the cookies are used more normally.
+The next function, `ddi_dma_cookie_get()`, was added to provide a way to
+get specific cookies. While looking over various driver's usage of the
+current APIs, we saw that sometimes drivers wanted to specifically do
+something with the first cookie (which may contain a header or something
+else) while the rest of the cookies are used normally.
 
-Finally, the last function was added out of the observation that may
+Finally, the last function was added out of the observation that many
 structures in device drivers, such as configuration data and descriptor
-rings can only support a single cookie. The goal of the
-`ddi_dma_cookie_one()` interface was to make it easy to get a single
+rings, can only support a single cookie. The goal of the
+`ddi_dma_cookie_one()` interface is to make it easy to get a single
 entry, but also have the underlying system confirm that only a single
 entry was asked for. Effectively, this function will VERIFY that only a
-single cookie associated with the request.
+single cookie is associated with the request.
 
 ### `ddi_dma_impl_t` changes
 
 The implementation of these functions has a few constraints:
 
-1. The current entry point, `ddi_dma_nextcookie()` still needs to work
-and the way that it does requires that underlying mutation mechanism.
-2. We want to minimize the amount of storage that we use for this as the
-`ddi_dma_impl_t` is allocated for every DMA allocation, so an increase
-in the size of this structure can have a large impact on used memory.
+1. The current entry point, `ddi_dma_nextcookie()`, still needs to work.
+Furthermore, it still requires the underlying mutation of the array.
+
+2. We want to minimize the amount of storage that we use so we can
+implement these APIs as the `ddi_dma_impl_t` is allocated for every DMA
+allocation. An increase in the size of this structure can have a large
+impact on used memory.
 
 To implement this, I propose we add a pair of `uint_t` members to the
 `ddi_dma_impl_t` structure. One will be used to track the total number
 of cookies. The second will be used to track what cookie we've mutated
 to. This will allow us to know how to find the first cookie in the array
-and make sure that we haven't mutated things too far.
+and make sure that we can't walk off the end of the array.
 
 ### Auxiliary Changes
 
@@ -241,21 +243,28 @@ require that they have to get this data as part of the bind call. As
 such, we propose that callers may pass NULL pointers for both arguments.
 This would impact the following DDI functions:
 
-* ddi_dma_addr_bind_handle(9F)
-* ddi_dma_buf_bind_handle(9F)
-* ddi_dma_getwin(9F)
+* `ddi_dma_addr_bind_handle(9F)`
+* `ddi_dma_buf_bind_handle(9F)`
+* `ddi_dma_getwin(9F)`
 
-One issue is that if a driver does this, it really should never call
-`ddi_dma_nextcookie()` because it will have, by definition, lost the
-first cookie. One suggestion to try and prevent this kind of programmer
-error is to have the above functions set a flag if we have a NULL cookie
-pointer and in such cases, consider it a fatal error if they then call
-`ddi_dma_nextcookie()`.
+If a driver does this it should not call `ddi_dma_nextcookie()`. If it
+does so, it will lose the first cookie. One suggestion to try and
+prevent this kind of programmer error is to have the above functions set
+a flag if we have a NULL cookie pointer, and in such cases, consider it a
+fatal error if they then call `ddi_dma_nextcookie()`.
 
 ### `ddi_dma_nextcookie()` hardening
 
+If a device driver erroneously calls `ddi_dma_nextcookie()` too many
+times and programs the device with the extra cookies, this will almost
+certainly result in arbitrary memory corruption in the system. Because
+of the cost of such a bug and the fact that this is a programmer error,
+we believe that it is justified to explicitly `panic()` the system in
+this case. Unfortunately, there is no address we can safely return to
+the device.
+
 To make sure that we don't have a memory corruption bug introduced by
-erroneously calling `ddi_dma_nextcookie()` our current thinking is that
+erroneously calling `ddi_dma_nextcookie()` we believe
 we should panic the system if we detect such a programming error.
 Unfortunately, if a driver mistakenly calls this and programs a device
 with that cookie, the end result is almost certainly arbitrary data
