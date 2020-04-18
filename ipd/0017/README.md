@@ -140,7 +140,7 @@ they will be concatenated together. All **service** level
 
 When entries are added to the environment, the starting environment will
 be that as described by the `environment` section of the Method Context
-(see [`smf_method(5)](https://illumos.org/man/5/smf_method). This means
+(see [`smf_method(5)`](https://illumos.org/man/5/smf_method). This means
 that when checking if an environment variable exists for appending, then
 anything described there such as `PATH` will already exist.
 
