@@ -86,8 +86,9 @@ each entry in `managed_paths`:
 
 1. It will make sure that the directory `path` is created and any
 directories leading up to it. `path` is subject to the standard SMF
-token expansion. This allows for folks to embed the instance and service
-name into it, or a property, much like is done for the start method.
+token expansion (`%r`, `%s`, `%i`, `%f`, properties, and escaping). This
+allows for folks to embed the instance and service name into it, or a
+property, much like is done for the start method.
 
 2. For any intermediate directory that does not exist, the system will
 create it such that it is owned by the user `root`, the group `root`,
@@ -185,19 +186,148 @@ that corresponding name space.
 Based on all these differences, it seems that there is value in allowing
 illumos distributions to continue to deliver service manifests in a way
 that is specific to their environment and their druthers. While illumos
-does have recommended locations for all of the different pieces, there
-are multiple ways to integrate packages and there's value in retaining
-this flexibility. If we picked something, at least some of the above
-would have to change and be frustrated by that. In general, I believe
-that SMF should allow one to implement their desired policy, but not
-force it.
+does have recommended locations for all of the different pieces (e.g.
+[`filesystem(5)`](https://illumos.org/man/5/filesystem), there are
+multiple ways to integrate packages and there's value in retaining this
+flexibility. If we picked something, at least some of the above would
+have to change and be frustrated by that. In general, I believe that SMF
+should allow one to implement their desired policy, but not force it.
 
-### Environment Appending vs. Clobbering
+### Behavior on Built-In Methods
 
-In our current design, we always source the SMF 
+Today, there are two special methods that are documented in SMF. These
+are `:kill` and `:true`. These respectively send a contract a specified
+signal and always succeed.
 
-XXX Allowing Full Paths
-XXX Chaning Perms, existing data
-XXX Environment Appending vs. Clobbering
-XXX Cleaning
-XXX Empty start methods (:kill, :true)
+In general, it is assumed that `:kill` is never used for the start
+method and is only used as part of a stop method. While this is assumed
+to generally only be used for the stop method due to the requirement of
+having a contract and it not making sense for a start method, that isn't
+a strict requirement.
+
+The `:true` method is used in a large number of services; however, most
+often for a `stop` or `refresh` method. There are a handful of milestones
+and other services that use `:true` for a start method.
+
+Today, both of these are handled in special ways in the startd code. For
+example, when they occur we do not gather the mthod context at all
+because we do not fork and exec a method. It seems like we should always
+support creating the directories. There could be several transient-style
+services where creating directories of the correct permissions is
+useful.
+
+The only reason not to do this is risk of gathering the assosciated
+method context when we didn't before. However, it seems like it is
+worthwhile to do so so we can have a uniform experience in the system.
+
+### Environment Variables
+
+In our current design, we always source the SMF method context
+environment variables before appending any created directories to the
+corresponding environment variables. There are a few design questions
+worth considering:
+
+1. Should multiple path entries be allowed to edit the same environment
+variable?
+2. Should these append or clobber the environment?
+3. Should these occur before the method context sets the environment or
+should the method context replace any entries that already exist?
+
+If we look at systemd, it does allow multiple entries to be created,
+however it only allows for specific environment variables that it
+controls to be used based on the type of path it has created. Here we
+considered a few different things:
+
+* It is useful to be able to have multiple paths join together similar
+to what systemd has done.
+
+* Various services have their own environment variables that they handle
+which can be directories and take them from the environment. For
+example, postgres supports the
+[`PGDATA`](https://www.postgresql.org/docs/12/app-postgres.html)
+environment variable which tells it where the data directory for the
+database is. Being able to create that directory for a specific
+instance, using the token expansion, and then setting the appropriate
+environment variable further reduces the complexity start method.
+
+* Beacuse we want to allow for the appending of variables, it seems like
+it makes more semantic sense to start from the existing method. This
+would allow certain things like the `PATH` or other directory based
+environment variables to be updated based on per-instance values.
+
+These different ideas have led me to suggest that we should honor the
+existing Method Context environment settings and that if we want the two
+to co-exist this is the only way that makes semantic sense.  Because the
+Method Context is always defined to set the environment to a known
+state, it makes sense to think of that as starting and creatin the base
+environment and ammending it to this point.
+
+### Existing Directories: Ownership and Permissions
+
+Currently, the system treats intermediate directories and the final
+specified directory of a path in different ways when it comes to
+permissions and ownership. Mainly that we don't change existing
+intermediate directories and that we always change existing final
+directories.
+
+The first thing we should think about is should we actually update the
+permissions and ownership of the final directory in a path. This invites
+a clash between a service and an administrator and multiple conflicting
+services. The first of these is a case where an administrator has set
+the permissions to the opposite of what the service intends to. This
+could happen intentionally or uninteionally. In the intentional case, if
+we do this, then we will clobber their intent; however, part of the goal
+of using the `managed_paths` functionality is to move regular
+maintenance of this into the service itself.
+
+Another reason to support changing the permissions and ownership of an
+existing service is service upgrade. A service may have been introduced
+that incorrectly ran as `root` or as `nobody` that was then switched to
+running as a dedicated service user. It would be useful if an update to
+the manifest file then took care of this. Otherwise it's likely that an
+updated manifest would send a service into maintenance. For example if
+`/var/run/myservice` was owned by root, but the service changed to run
+as the user `myservice`, then the system would not function correctly.
+
+Another consideration is what this means for service with overlapping
+directory structures. For example, if service 1 wants to use the path
+`/var/run/net` and another service wants to use `/var/run/net/foobar`.
+While this kind of configuration isn't recommended, it is certainly
+possible today and many start methods that are trying to create
+corresponding directories are running as root already!
+
+In the second service started and created its directory path, then we'd
+initially have `/var/run/net` owned by the user and group `root` with
+the permissions `0755`. However, when the first service started up, it'd
+change that to the service's user and group and probably `0770`, this
+cutting off access to the second service. This isn't great, but it's not
+clear that because of this we should take active steps to prevent it
+from happening as one could also create somethin where this makes sense.
+
+One place where this gets messy though is the question of ownership of
+the files and directories that exist in the directory. systemd says that
+it will always recursively change the ownership of contents under the
+directory to match the parent. Though it notes that it has an
+optimization where in if everything in the target directory matches then
+it will not do anything else. We should consider a similar feature. The
+main argument for this, in my opinion, is the service upgrade feature
+set. When we upgrade a service and change the user, it would be useful
+if it then had full control over all the files and subdirectories that
+it owned. While such a feature would further complicate the overlapping
+service problem, it does seem like something worthwhile.
+
+### Cleaning Directories
+
+The current option to clean directories out is a variant of a feature
+that systemd has. systemd currently 
+
+## Open Questions
+
+This section contains open questions that we want to answer:
+
+1. We should likely add support for recursively chowning the contents of
+a directory as discussed in the `Existing Directories: Ownership and
+Permissions` section.  Should this be something that a service can opt
+out of like the emptying of the directory? If we do this, should the
+same optimization be done like systemd? If so, should we allow that to
+be controlled?
