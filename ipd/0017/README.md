@@ -53,7 +53,7 @@ The third option is useful for software where such options are
 over ridable in the environment. This allows for less logic to have to be
 placed into a start method which wraps this.
 
-Finally, the fourth goal is for software which often has pid files or is
+Finally, the fourth goal is for software which often has PID files or is
 expecting the directory that it receives to be empty. Please see the
 Design Considerations section further on for more on this and the trade
 offs.
@@ -193,6 +193,12 @@ flexibility. If we picked something, at least some of the above would
 have to change and be frustrated by that. In general, I believe that SMF
 should allow one to implement their desired policy, but not force it.
 
+From a different perspective, another reason to have flexibility is that
+there are a number of services that run to actually mount `/var` and
+other directories. If we were to hardcode paths, we would probably have
+to create something separate for services that run before early manifest
+import.
+
 ### Behavior on Built-In Methods
 
 Today, there are two special methods that are documented in SMF. These
@@ -210,13 +216,13 @@ often for a `stop` or `refresh` method. There are a handful of milestones
 and other services that use `:true` for a start method.
 
 Today, both of these are handled in special ways in the startd code. For
-example, when they occur we do not gather the mthod context at all
+example, when they occur we do not gather the method context at all
 because we do not fork and exec a method. It seems like we should always
 support creating the directories. There could be several transient-style
 services where creating directories of the correct permissions is
 useful.
 
-The only reason not to do this is risk of gathering the assosciated
+The only reason not to do this is risk of gathering the associated
 method context when we didn't before. However, it seems like it is
 worthwhile to do so so we can have a uniform experience in the system.
 
@@ -250,7 +256,7 @@ database is. Being able to create that directory for a specific
 instance, using the token expansion, and then setting the appropriate
 environment variable further reduces the complexity start method.
 
-* Beacuse we want to allow for the appending of variables, it seems like
+* Because we want to allow for the appending of variables, it seems like
 it makes more semantic sense to start from the existing method. This
 would allow certain things like the `PATH` or other directory based
 environment variables to be updated based on per-instance values.
@@ -259,8 +265,8 @@ These different ideas have led me to suggest that we should honor the
 existing Method Context environment settings and that if we want the two
 to co-exist this is the only way that makes semantic sense.  Because the
 Method Context is always defined to set the environment to a known
-state, it makes sense to think of that as starting and creatin the base
-environment and ammending it to this point.
+state, it makes sense to think of that as starting and creating the base
+environment and amending it to this point.
 
 ### Existing Directories: Ownership and Permissions
 
@@ -275,7 +281,7 @@ permissions and ownership of the final directory in a path. This invites
 a clash between a service and an administrator and multiple conflicting
 services. The first of these is a case where an administrator has set
 the permissions to the opposite of what the service intends to. This
-could happen intentionally or uninteionally. In the intentional case, if
+could happen intentionally or unintentionally. In the intentional case, if
 we do this, then we will clobber their intent; however, part of the goal
 of using the `managed_paths` functionality is to move regular
 maintenance of this into the service itself.
@@ -302,7 +308,7 @@ the permissions `0755`. However, when the first service started up, it'd
 change that to the service's user and group and probably `0770`, this
 cutting off access to the second service. This isn't great, but it's not
 clear that because of this we should take active steps to prevent it
-from happening as one could also create somethin where this makes sense.
+from happening as one could also create something where this makes sense.
 
 One place where this gets messy though is the question of ownership of
 the files and directories that exist in the directory. systemd says that
@@ -319,7 +325,80 @@ service problem, it does seem like something worthwhile.
 ### Cleaning Directories
 
 The current option to clean directories out is a variant of a feature
-that systemd has. systemd currently 
+that systemd has. When a directory represents a runtime directory
+(something located under `/run`) then when the service unit stops or a
+user issues a command, then all of the directory contents will be
+cleaned up from that last directory component. For example, if you
+created `/run/foo/bar`, everything under `/run/foo/bar` would be cleaned
+up, but `/run/foo` would not be touched.
+
+While considering this, there were a few different things that we
+thought about. There are a few observations that we were thinking about:
+
+1. A common use case for this is daemons which have PID files.
+
+2. These are often created on `tmpfs` backed files, but aren't always.
+
+3. We need to worry about not just a crash of the system, but also if
+`svc.startd` crashes, how do we know to make sure everything is in a
+good state for the service.
+
+As a result, we thought about allowing services to opt into something
+being cleaned up when the service starts. This does a few useful things:
+
+1. It makes it so that all of the logic around the paths only happens in
+the `start` method, simplifying the mental model around how the feature
+works. This means that we have less state tracking code and clean up.
+
+2. Even if `svc.startd` or `svc.configd` crashes while we're in the
+middle of an operation, because this is only happening on start up, we
+don't need to worry about tracking the state of what should have been
+cleaned up.
+
+3. If the system crashed and the directory wasn't backed by a `tmpfs` or
+other memory-based file system, it will still be cleaned up.
+
+One of the big complexities around this is the rather obvious thing
+we're creating to screw ourselves up. If two services overlap and both
+specify cleaning behavior (regardless of on start or stop), then they
+will end up removing each others files. We considered doing a few things
+here like state tracking and only cleaning up when the last service that
+specified a directory was done, but this felt like a major complication
+and one of dubious value.
+
+A fundamental reality is that any service that an administrator imports
+basically has the power to remove arbitrary files in the file system in
+its start method. While, this method certainly makes it easier, it also
+makes it more visible. While it's true that we are punting this problem
+onto the folks packaging software, I'm not sure that's any less true
+than it already was.
+
+One thing that we should consider is what amount of safe guards should
+we add in here? Should we make sure that we're not descending into
+`/dev`, `/devices/`, `/system`, or `/proc`?
+
+### Other Security Considerations
+
+When walking a directory tree, there is an inherent [TOCTTOU
+vulnerability](https://en.wikipedia.org/wiki/Time-of-check_to_time-of-use).
+For example, if someone maliciously replaces a directory with a symbolic
+link or similar, that can be a trickier thing to handle.  One solution
+is to basically do all the manipulation of the permissions and ownership
+using operations on file descriptors (e.g. fchown(2), fchmod(2), etc.)
+and always using openat(2) to always move forward one directory at a
+time.
+
+However, if something else has elevated permissions, being root on the
+intermediate path, or an administrator has set a service to run on a
+user-controlled path, then it's not clear if there's a lot that we can
+do to prevent something malicious from happening. Even if we take care
+of creating our paths, there's nothing that stops something else from
+manipulating those.
+
+We need to think carefully about whether or not we should honor symbolic
+links found as we incrementally process these paths. While we should
+never follow symbol links on clean up, it's an interesting question on
+what we should do along the way.
 
 ## Open Questions
 
@@ -331,3 +410,12 @@ Permissions` section.  Should this be something that a service can opt
 out of like the emptying of the directory? If we do this, should the
 same optimization be done like systemd? If so, should we allow that to
 be controlled?
+
+2. What precautions should we take when cleaning up directories
+specified by a user? Should we try to look at the paths and refuse to
+create or operate on certain prefixes (e.g. `/dev`, `/proc`, etc.)? Some
+of that we won't be able to do until after token expansion of the path
+has been completed.
+
+3. How should we handle symbolic links that we encounter while tying to
+expand the directory path.
